@@ -1,0 +1,13 @@
+slug,name,region,start_year,end_year,lat,lon
+roman,Roman Republic/Empire,Europe,-509,476,41.9,12.5
+han,Han Dynasty,East Asia,-206,220,34.3,108.9
+mauryan,Mauryan Empire,South Asia,-322,-185,25.6,85.1
+akemenid,Achaemenid Empire,Middle East,-550,-330,32.6,51.7
+ptolemaic,Ptolemaic Kingdom,Africa,-305,-30,30.0,31.2
+olmec,Olmec Civilisation,Americas,-1400,-400,18.0,-95.0
+maya,Maya Civilisation,Americas,-200,1697,17.0,-88.0
+inca,Inca Empire,Americas,1438,1533,-13.5,-71.9
+song,Song Dynasty,East Asia,960,1279,30.6,114.3
+gupta,Gupta Empire,South Asia,320,550,25.6,85.1
+sumer,Sumer,Middle East,-4500,-1900,31.3,45.6
+axum,Kingdom of Aksum,Africa,80,940,14.1,38.7
