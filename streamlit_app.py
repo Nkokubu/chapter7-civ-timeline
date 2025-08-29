@@ -103,33 +103,56 @@ def _norm_kind(k: str | None) -> str:
 
 
 def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
-    """Create a Plotly figure of horizontal bands (one per civ) + colored event dots by kind."""
+    """
+    Horizontal bands per civilization using CIV LIFESPAN (start_year→end_year),
+    clipped to the selected range. Event dots are still filtered by current UI.
+    """
     start_sel, end_sel = year_range
 
-    # Collect min/max year per civ within the current selection
-    by_civ: Dict[int, Dict] = {}
+    # Civs present in the current filtered result (so region/tags still control visibility)
+    allowed_ids = set()
+    civ_info: Dict[int, Dict] = {}  # id -> {label, start_year, end_year}
     for e in events:
         c = e.civilization
         if not c:
             continue
-        bucket = by_civ.setdefault(
-            c.id, {"id": c.id, "label": c.name, "slug": c.slug, "region": c.region, "years": []}
-        )
-        bucket["years"].append(e.year)
+        allowed_ids.add(c.id)
+        # record lifespan once per civ
+        if c.id not in civ_info:
+            # prefer explicit lifespan; if missing, fall back to event years
+            life_start = getattr(c, "start_year", None)
+            life_end   = getattr(c, "end_year", None)
+            if life_start is None or life_end is None:
+                life_start = e.year if life_start is None else life_start
+                life_end   = e.year if life_end   is None else life_end
+            civ_info[c.id] = {
+                "label": c.name,
+                "start_year": life_start,
+                "end_year": life_end,
+            }
 
+    # Build rows from lifespan, not event span
     rows = []
-    for data in by_civ.values():
+    for cid in sorted(allowed_ids, key=lambda k: civ_info[k]["label"]):
+        info = civ_info.get(cid)
+        if not info:
+            continue
+        life_start = info["start_year"]
+        life_end   = info["end_year"]
+        if life_start is None or life_end is None:
+            continue  # skip if still unknown
         # clip to selection
-        start = max(min(data["years"]), start_sel)
-        end   = min(max(data["years"]), end_sel)
+        start = max(life_start, start_sel)
+        end   = min(life_end,   end_sel)
         if start > end:
-            continue  # nothing in range after clipping
-
-        # avoid completely flat bars (Plotly doesn't render zero-length)
-        dur = max(end - start, 0.1)
+            continue  # outside the selected window
+        dur = end - start
+        # Plotly needs positive width; if lifespan collapses to a point (unlikely), give a hairline
+        if dur <= 0:
+            dur = 0.1
         rows.append({
-            "id": data["id"],
-            "label": data["label"],
+            "id": cid,
+            "label": info["label"],
             "base": start,
             "dur": dur,
             "start": start,
@@ -139,18 +162,18 @@ def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
     if not rows:
         return None
 
-    # Sort by earliest start, then name
-    rows.sort(key=lambda r: (r["start"], r["label"]))
+    # Sort bars by label
+    rows.sort(key=lambda r: r["label"])
     label_order = [r["label"] for r in rows]
-    allowed_ids = {r["id"] for r in rows}  # only mark events for civs we actually show
+    allowed_ids = {r["id"] for r in rows}  # final set (after clipping)
 
     fig = go.Figure()
 
-    # ---- bands (same as before) ----
+    # ---- bands (lifespan) ----
     fig.add_trace(go.Bar(
         orientation="h",
         y=label_order,
-        x=[r["dur"] for r in rows],      # bar length = duration
+        x=[r["dur"] for r in rows],      # bar length = lifespan within selection
         base=[r["base"] for r in rows],  # where each bar starts on the x-axis
         customdata=[[ _fmt_year(r["start"]), _fmt_year(r["end"]), int(round(r["end"] - r["start"])) ] for r in rows],
         hovertemplate="<b>%{y}</b><br>Start: %{customdata[0]}<br>End: %{customdata[1]}<br>Duration: %{customdata[2]} years<extra></extra>",
@@ -158,11 +181,8 @@ def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
         showlegend=False,
     ))
 
-    # ---- event dots colored by kind ----
-    # group events by normalized kind
-    points_by_kind: Dict[str, Dict[str, list]] = {
-        k: {"x": [], "y": [], "text": []} for k in KIND_TAXONOMY + ["other"]
-    }
+    # ---- event dots (filtered by current UI) ----
+    points_by_kind: Dict[str, Dict[str, list]] = {k: {"x": [], "y": [], "text": []} for k in KIND_TAXONOMY + ["other"]}
 
     for e in events:
         c = e.civilization
@@ -170,14 +190,11 @@ def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
             continue
         if not (start_sel <= e.year <= end_sel):
             continue
-
         kind = _norm_kind(e.kind)
         points_by_kind[kind]["x"].append(e.year)
-        points_by_kind[kind]["y"].append(c.name)  # matches band labels
-        # hover shows title and year (use BCE/CE formatting)
+        points_by_kind[kind]["y"].append(c.name)
         points_by_kind[kind]["text"].append(f"{e.title}<br>{_fmt_year(e.year)}")
 
-    # add a scatter trace per kind (only if we have points) so the legend is clean
     for kind in KIND_TAXONOMY + ["other"]:
         data = points_by_kind[kind]
         if not data["x"]:
@@ -204,10 +221,10 @@ def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         barmode="overlay",
         margin=dict(l=160, r=20, t=10, b=40),
-        height=380 + 12 * len(rows),  # grow height as rows increase
+        height=380 + 12 * len(rows),
     )
     fig.update_xaxes(title="Year", range=[start_sel, end_sel], zeroline=True, zerolinewidth=1)
-    fig.update_yaxes(title="", autorange="reversed")  # most recent on top; flip if you prefer
+    fig.update_yaxes(title="", autorange="reversed")
 
     return fig
 
