@@ -71,8 +71,39 @@ def _fmt_year(y: int) -> str:
         return f"{y} CE"
     return "0"
 
+# ---- kind taxonomy, colors, icons ----
+KIND_TAXONOMY = ["war", "dynasty", "tech", "culture", "economy", "religion"]
+
+KIND_COLORS = {
+    "war": "#EF553B",       # red-ish
+    "dynasty": "#636EFA",   # blue
+    "tech": "#00CC96",      # green
+    "culture": "#AB63FA",   # purple
+    "economy": "#FFA15A",   # orange
+    "religion": "#19D3F3",  # cyan
+    "other": "#B6E880",     # soft green fallback
+}
+
+KIND_SYMBOLS = {
+    "war": "triangle-up",
+    "dynasty": "square",
+    "tech": "diamond",
+    "culture": "circle",
+    "economy": "cross",
+    "religion": "star",
+    "other": "circle-open",
+}
+
+def _norm_kind(k: str | None) -> str:
+    """Normalize arbitrary kind strings into our taxonomy; unknowns -> 'other'."""
+    if not k:
+        return "other"
+    kk = k.strip().lower()
+    return kk if kk in KIND_TAXONOMY else "other"
+
+
 def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
-    """Create a Plotly figure of horizontal bands (one per civ) within the selected range."""
+    """Create a Plotly figure of horizontal bands (one per civ) + colored event dots by kind."""
     start_sel, end_sel = year_range
 
     # Collect min/max year per civ within the current selection
@@ -81,7 +112,9 @@ def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
         c = e.civilization
         if not c:
             continue
-        bucket = by_civ.setdefault(c.id, {"name": c.name, "slug": c.slug, "region": c.region, "years": []})
+        bucket = by_civ.setdefault(
+            c.id, {"id": c.id, "label": c.name, "slug": c.slug, "region": c.region, "years": []}
+        )
         bucket["years"].append(e.year)
 
     rows = []
@@ -95,7 +128,8 @@ def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
         # avoid completely flat bars (Plotly doesn't render zero-length)
         dur = max(end - start, 0.1)
         rows.append({
-            "label": data["name"],
+            "id": data["id"],
+            "label": data["label"],
             "base": start,
             "dur": dur,
             "start": start,
@@ -107,28 +141,76 @@ def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
 
     # Sort by earliest start, then name
     rows.sort(key=lambda r: (r["start"], r["label"]))
+    label_order = [r["label"] for r in rows]
+    allowed_ids = {r["id"] for r in rows}  # only mark events for civs we actually show
 
     fig = go.Figure()
+
+    # ---- bands (same as before) ----
     fig.add_trace(go.Bar(
         orientation="h",
-        y=[r["label"] for r in rows],
+        y=label_order,
         x=[r["dur"] for r in rows],      # bar length = duration
         base=[r["base"] for r in rows],  # where each bar starts on the x-axis
         customdata=[[ _fmt_year(r["start"]), _fmt_year(r["end"]), int(round(r["end"] - r["start"])) ] for r in rows],
         hovertemplate="<b>%{y}</b><br>Start: %{customdata[0]}<br>End: %{customdata[1]}<br>Duration: %{customdata[2]} years<extra></extra>",
         marker=dict(opacity=0.85),
+        showlegend=False,
     ))
 
+    # ---- event dots colored by kind ----
+    # group events by normalized kind
+    points_by_kind: Dict[str, Dict[str, list]] = {
+        k: {"x": [], "y": [], "text": []} for k in KIND_TAXONOMY + ["other"]
+    }
+
+    for e in events:
+        c = e.civilization
+        if not c or c.id not in allowed_ids:
+            continue
+        if not (start_sel <= e.year <= end_sel):
+            continue
+
+        kind = _norm_kind(e.kind)
+        points_by_kind[kind]["x"].append(e.year)
+        points_by_kind[kind]["y"].append(c.name)  # matches band labels
+        # hover shows title and year (use BCE/CE formatting)
+        points_by_kind[kind]["text"].append(f"{e.title}<br>{_fmt_year(e.year)}")
+
+    # add a scatter trace per kind (only if we have points) so the legend is clean
+    for kind in KIND_TAXONOMY + ["other"]:
+        data = points_by_kind[kind]
+        if not data["x"]:
+            continue
+        fig.add_trace(go.Scatter(
+            mode="markers",
+            x=data["x"],
+            y=data["y"],
+            name=kind.title(),
+            text=data["text"],
+            hoverinfo="text",
+            marker=dict(
+                size=9,
+                color=KIND_COLORS.get(kind, KIND_COLORS["other"]),
+                symbol=KIND_SYMBOLS.get(kind, KIND_SYMBOLS["other"]),
+                line=dict(width=0.5),
+                opacity=0.95,
+            ),
+        ))
+
     fig.update_layout(
-        showlegend=False,
+        showlegend=True,
+        legend_title_text="Event kind",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         barmode="overlay",
-        margin=dict(l=140, r=20, t=10, b=40),
-        height=350 + 12 * len(rows),  # grow height as rows increase
+        margin=dict(l=160, r=20, t=10, b=40),
+        height=380 + 12 * len(rows),  # grow height as rows increase
     )
     fig.update_xaxes(title="Year", range=[start_sel, end_sel], zeroline=True, zerolinewidth=1)
-    fig.update_yaxes(title="", autorange="reversed")  # most recent on top feels nice; flip if you prefer
+    fig.update_yaxes(title="", autorange="reversed")  # most recent on top; flip if you prefer
 
     return fig
+
 
 def _build_civ_map(events: List[Event], by_civ: Dict[int, List[Event]]):
     """Return a Plotly geo scatter of civ centroids for the current filtered set."""
