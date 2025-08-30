@@ -9,6 +9,9 @@ from app.db.session import get_session
 from app.models.civilization import Civilization
 from app.models.event import Event
 import plotly.graph_objects as go
+import math
+from typing import Optional
+
 
 st.set_page_config(page_title="Civilization Explorer", layout="wide")
 
@@ -45,13 +48,26 @@ def _query_events(year_range: Tuple[int, int], regions: List[str], tags: List[st
         stmt = select(Event).options(selectinload(Event.civilization))
         conds = [Event.year >= start, Event.year <= end]
 
+        # region filter (partial match so "Asia" hits "East Asia")
         if regions:
-            # join to civ to filter by region (partial match so "Asia" matches "East Asia")
             stmt = stmt.join(Civilization)
             conds.append(or_(*[Civilization.region.ilike(f"%{r}%") for r in regions]))
 
+        # tags & kind filter (treat taxonomy words like "tech" as kind too)
         if tags:
-            conds.append(or_(*[Event.tags.ilike(f"%{t}%") for t in tags]))
+            terms = [t.strip() for t in tags if t and t.strip()]
+            kind_terms = [t.lower() for t in terms if t.lower() in KIND_TAXONOMY]
+            tag_terms  = [t for t in terms if t.lower() not in KIND_TAXONOMY]
+
+            preds = []
+            if tag_terms:
+                preds.append(or_(*[Event.tags.ilike(f"%{t}%") for t in tag_terms]))
+            if kind_terms:
+                preds.append(or_(*[Event.kind.ilike(k) for k in kind_terms]))  # case-insensitive
+
+            if preds:
+                # match if EITHER the tags contain any term OR the kind matches any taxonomy term selected
+                conds.append(or_(*preds))
 
         stmt = stmt.where(and_(*conds)).order_by(Event.year)
         return s.exec(stmt).all()
@@ -104,84 +120,65 @@ def _norm_kind(k: str | None) -> str:
 
 def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
     """
-    Horizontal bands per civilization using CIV LIFESPAN (start_year→end_year),
-    clipped to the selected range. Event dots are still filtered by current UI.
+    Bars = civilization lifespan (start_year→end_year, or full event span if missing),
+    clipped to the selected year range. Dots = filtered events.
     """
     start_sel, end_sel = year_range
 
-    # Civs present in the current filtered result (so region/tags still control visibility)
-    allowed_ids = set()
-    civ_info: Dict[int, Dict] = {}  # id -> {label, start_year, end_year}
-    for e in events:
-        c = e.civilization
-        if not c:
-            continue
-        allowed_ids.add(c.id)
-        # record lifespan once per civ
-        if c.id not in civ_info:
-            # prefer explicit lifespan; if missing, fall back to event years
-            life_start = getattr(c, "start_year", None)
-            life_end   = getattr(c, "end_year", None)
-            if life_start is None or life_end is None:
-                life_start = e.year if life_start is None else life_start
-                life_end   = e.year if life_end   is None else life_end
-            civ_info[c.id] = {
-                "label": c.name,
-                "start_year": life_start,
-                "end_year": life_end,
-            }
+    # civs visible under current filters (region/tags/year)
+    civ_ids = sorted({e.civilization.id for e in events if e.civilization})
+    if not civ_ids:
+        return None
 
-    # Build rows from lifespan, not event span
+    # fetch civ records
+    with get_session() as s:
+        civs = s.exec(select(Civilization).where(Civilization.id.in_(civ_ids))).all()
+
     rows = []
-    for cid in sorted(allowed_ids, key=lambda k: civ_info[k]["label"]):
-        info = civ_info.get(cid)
-        if not info:
+    for civ in civs:
+        span = _lifespan_for_civ(civ)  # uses start/end if present; else min/max of ALL events for that civ
+        if not span:
             continue
-        life_start = info["start_year"]
-        life_end   = info["end_year"]
-        if life_start is None or life_end is None:
-            continue  # skip if still unknown
-        # clip to selection
-        start = max(life_start, start_sel)
-        end   = min(life_end,   end_sel)
-        if start > end:
-            continue  # outside the selected window
-        dur = end - start
-        # Plotly needs positive width; if lifespan collapses to a point (unlikely), give a hairline
+        s_clip = max(span[0], start_sel)
+        e_clip = min(span[1], end_sel)
+        if s_clip > e_clip:
+            continue
+        dur = e_clip - s_clip
         if dur <= 0:
             dur = 0.1
         rows.append({
-            "id": cid,
-            "label": info["label"],
-            "base": start,
+            "id": civ.id,
+            "label": civ.name,
+            "base": s_clip,
             "dur": dur,
-            "start": start,
-            "end": end,
+            "start": s_clip,
+            "end": e_clip,
         })
 
     if not rows:
         return None
 
-    # Sort bars by label
     rows.sort(key=lambda r: r["label"])
     label_order = [r["label"] for r in rows]
-    allowed_ids = {r["id"] for r in rows}  # final set (after clipping)
+    y_for_id = {r["id"]: r["label"] for r in rows}
+    allowed_ids = set(y_for_id.keys())
 
+    import plotly.graph_objects as go
     fig = go.Figure()
 
-    # ---- bands (lifespan) ----
+    # bars
     fig.add_trace(go.Bar(
         orientation="h",
         y=label_order,
-        x=[r["dur"] for r in rows],      # bar length = lifespan within selection
-        base=[r["base"] for r in rows],  # where each bar starts on the x-axis
+        x=[r["dur"] for r in rows],
+        base=[r["base"] for r in rows],
         customdata=[[ _fmt_year(r["start"]), _fmt_year(r["end"]), int(round(r["end"] - r["start"])) ] for r in rows],
         hovertemplate="<b>%{y}</b><br>Start: %{customdata[0]}<br>End: %{customdata[1]}<br>Duration: %{customdata[2]} years<extra></extra>",
         marker=dict(opacity=0.85),
         showlegend=False,
     ))
 
-    # ---- event dots (filtered by current UI) ----
+    # dots (by kind), only for civs that have bars and events in-range
     points_by_kind: Dict[str, Dict[str, list]] = {k: {"x": [], "y": [], "text": []} for k in KIND_TAXONOMY + ["other"]}
 
     for e in events:
@@ -192,7 +189,7 @@ def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
             continue
         kind = _norm_kind(e.kind)
         points_by_kind[kind]["x"].append(e.year)
-        points_by_kind[kind]["y"].append(c.name)
+        points_by_kind[kind]["y"].append(y_for_id[c.id])
         points_by_kind[kind]["text"].append(f"{e.title}<br>{_fmt_year(e.year)}")
 
     for kind in KIND_TAXONOMY + ["other"]:
@@ -225,10 +222,135 @@ def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
     )
     fig.update_xaxes(title="Year", range=[start_sel, end_sel], zeroline=True, zerolinewidth=1)
     fig.update_yaxes(title="", autorange="reversed")
-
     return fig
 
+def _lifespan_for_civ(civ: Civilization) -> Optional[Tuple[int, int]]:
+    """Return (start_year, end_year) for a civ; fall back to full event range if needed."""
+    if civ.start_year is not None and civ.end_year is not None:
+        return civ.start_year, civ.end_year
+    # fallback: derive from *all* events for this civ
+    with get_session() as s:
+        ys = s.exec(select(Event.year).where(Event.civilization_id == civ.id)).all()
+    if not ys:
+        return None
+    years = [y[0] if isinstance(y, tuple) else y for y in ys]
+    return min(years), max(years)
 
+def _clip_interval(a: Tuple[int, int], window: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+    """Clip [a0,a1] to window [w0,w1]; return None if no intersection."""
+    a0, a1 = a; w0, w1 = window
+    s, e = max(a0, w0), min(a1, w1)
+    return (s, e) if s <= e else None
+
+def _overlap_years(a: Tuple[int, int], b: Tuple[int, int], window: Tuple[int, int]) -> int:
+    """Overlap length of two intervals, after clipping both to window."""
+    a_ = _clip_interval(a, window)
+    b_ = _clip_interval(b, window)
+    if not a_ or not b_:
+        return 0
+    s = max(a_[0], b_[0]); e = min(a_[1], b_[1])
+    return max(0, e - s)
+
+def _neighbors_by_overlap(target: Civilization, window: Tuple[int, int], limit: int = 12) -> List[Dict]:
+    """Return neighbors sorted by overlap (desc). Each item: {id,name,slug,overlap,ov_start,ov_end}."""
+    t_span = _lifespan_for_civ(target)
+    if not t_span:
+        return []
+    t_clip = _clip_interval(t_span, window)
+    if not t_clip:
+        return []
+
+    with get_session() as s:
+        others = s.exec(select(Civilization).where(Civilization.id != target.id)).all()
+
+    rows: List[Dict] = []
+    for c in others:
+        c_span = _lifespan_for_civ(c)
+        if not c_span:
+            continue
+        ov = _overlap_years(t_span, c_span, window)
+        if ov <= 0:
+            continue
+        # also record the clipped overlap interval for display
+        tc = _clip_interval(t_span, window); cc = _clip_interval(c_span, window)
+        if not tc or not cc:
+            continue
+        s_ = max(tc[0], cc[0]); e_ = min(tc[1], cc[1])
+        rows.append({"id": c.id, "name": c.name, "slug": c.slug, "overlap": ov, "ov_start": s_, "ov_end": e_})
+
+    rows.sort(key=lambda r: (-r["overlap"], r["name"]))
+    return rows[:limit]
+
+def _build_neighbor_graph(target: Civilization, neighbors: List[Dict]) -> Optional[go.Figure]:
+    """Simple radial network: target at center; neighbors on a circle; edge width scales with overlap."""
+    if not neighbors:
+        return None
+
+    # positions
+    cx, cy = 0.0, 0.0
+    r = 1.0
+    n = len(neighbors)
+    if n == 1:
+        angles = [0.0]
+    else:
+        angles = [2 * math.pi * i / n for i in range(n)]
+
+    pos = []
+    for ang in angles:
+        pos.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+
+    max_ov = max(nb["overlap"] for nb in neighbors) or 1
+
+    fig = go.Figure()
+
+    # edges
+    for (x, y), nb in zip(pos, neighbors):
+        w = 1.0 + 6.0 * (nb["overlap"] / max_ov)
+        fig.add_trace(go.Scatter(
+            x=[cx, x], y=[cy, y],
+            mode="lines",
+            line=dict(width=w, color="rgba(120,120,120,0.6)"),
+            hoverinfo="text",
+            hovertext=f"{target.name} ↔ {nb['name']}<br>Overlap: {nb['overlap']} yrs",
+            showlegend=False,
+        ))
+
+    # neighbor nodes
+    fig.add_trace(go.Scatter(
+        x=[x for x, _ in pos],
+        y=[y for _, y in pos],
+        mode="markers+text",
+        marker=dict(size=12),
+        text=[nb["name"] for nb in neighbors],
+        textposition="bottom center",
+        name="Contemporaries",
+        hoverinfo="text",
+        hovertext=[f"{nb['name']}<br>{_fmt_year(nb['ov_start'])} → {_fmt_year(nb['ov_end'])}<br>{nb['overlap']} yrs"
+                   for nb in neighbors],
+    ))
+
+    # center node (target civ)
+    fig.add_trace(go.Scatter(
+        x=[cx], y=[cy],
+        mode="markers+text",
+        marker=dict(size=18, color="#F4B400"),  # gold-ish
+        text=[target.name],
+        textposition="top center",
+        name="Selected",
+        hoverinfo="text",
+        hovertext=[f"{target.name}"],
+    ))
+
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=420,
+        showlegend=False,
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+    )
+    return fig
+
+ 
 def _build_civ_map(events: List[Event], by_civ: Dict[int, List[Event]]):
     """Return a Plotly geo scatter of civ centroids for the current filtered set."""
     civ_ids = list(by_civ.keys())
@@ -398,3 +520,23 @@ else:
                         st.write(e.summary)
                     if e.kind or e.tags:
                         st.caption(", ".join(filter(None, [e.kind, e.tags])))
+    
+            # --- Neighbors in time (Day 9) ---
+            st.subheader("Neighbors in time")
+            st.caption(f"Overlaps computed within the current window: {_fmt_year(year_range[0])} to {_fmt_year(year_range[1])}.")
+            nbrs = _neighbors_by_overlap(civ, year_range)
+
+            if not nbrs:
+                st.info("No overlapping civilizations in this window.")
+            else:
+                # ranked list
+                for nb in nbrs:
+                    st.write(f"- **{nb['name']}** — {nb['overlap']} yrs "
+                             f"({_fmt_year(nb['ov_start'])} → {_fmt_year(nb['ov_end'])})")
+
+                # small network graph
+                net = _build_neighbor_graph(civ, nbrs)
+                if net:
+                    st.plotly_chart(net, use_container_width=True)
+
+            st.divider()  
