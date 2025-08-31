@@ -87,6 +87,32 @@ def _fmt_year(y: int) -> str:
         return f"{y} CE"
     return "0"
 
+def _kind_counts(events: List[Event]) -> Dict[str, int]:
+    counts = {k: 0 for k in KIND_TAXONOMY + ["other"]}
+    for e in events:
+        counts[_norm_kind(e.kind)] += 1
+    return counts
+
+def _build_compare_chart(name_a: str, cnt_a: Dict[str, int], name_b: str, cnt_b: Dict[str, int]) -> go.Figure:
+    x = [name_a, name_b]
+    fig = go.Figure()
+    for kind in KIND_TAXONOMY + ["other"]:
+        fig.add_trace(go.Bar(
+            x=x,
+            y=[cnt_a.get(kind, 0), cnt_b.get(kind, 0)],
+            name=kind.title(),
+            marker_color=KIND_COLORS.get(kind, KIND_COLORS["other"]),
+        ))
+    fig.update_layout(
+        barmode="stack",
+        margin=dict(l=20, r=20, t=10, b=10),
+        height=420,
+        legend_title_text="Event kind",
+        yaxis_title="Events (count)",
+    )
+    return fig
+
+
 # ---- kind taxonomy, colors, icons ----
 KIND_TAXONOMY = ["war", "dynasty", "tech", "culture", "economy", "religion"]
 
@@ -424,6 +450,88 @@ all_tags = _distinct_tags()
 
 selected_regions = st.sidebar.multiselect("Regions", options=all_regions, default=[])
 selected_tags = st.sidebar.multiselect("Tags", options=all_tags, default=[])
+compare_mode = st.sidebar.checkbox("Compare two civilizations", value=False)
+
+
+#----------- Compare View ------------
+
+if compare_mode:
+    st.title("Compare civilizations")
+
+    # Use same filters as list view
+    tags_list = _split_csv(selected_tags)
+    events = _query_events(year_range, selected_regions, tags_list)
+    by_civ = _group_events_by_civ(events)
+
+    civ_ids = list(by_civ.keys())
+    if not civ_ids:
+        st.info("No civilizations match the current filters. Try widening your year range or clearing tags/regions.")
+        st.stop()
+
+    # Fetch civ objects for the options (ordered)
+    with get_session() as s:
+        civs = s.exec(select(Civilization).where(Civilization.id.in_(civ_ids)).order_by(Civilization.name)).all()
+
+    # Try to default to Rome vs Han if available
+    def find_index(slug_sub: str) -> int | None:
+        slug_sub = slug_sub.lower()
+        for i, c in enumerate(civs):
+            if c.slug and slug_sub in c.slug.lower():
+                return i
+        return None
+
+    idx_rome = find_index("roman") or find_index("rome")
+    idx_han  = find_index("han")
+
+    # Fallback to first two options if Rome/Han not both present
+    if idx_rome is None or idx_han is None or idx_rome == idx_han:
+        idx_rome, idx_han = 0, 1 if len(civs) > 1 else (0, 0)
+
+    colA, colB = st.columns(2)
+    with colA:
+        civ_a = st.selectbox("Civilization A", civs, index=idx_rome, format_func=lambda c: c.name, key="cmp_civ_a")
+    with colB:
+        civ_b = st.selectbox("Civilization B", civs, index=idx_han,  format_func=lambda c: c.name, key="cmp_civ_b")
+
+    if civ_a.id == civ_b.id:
+        st.warning("Pick two different civilizations to compare.")
+        st.stop()
+
+    # Events in current window/filters for each civ
+    ev_a = by_civ.get(civ_a.id, [])
+    ev_b = by_civ.get(civ_b.id, [])
+
+    # Quick stats (within current window)
+    def _summ(evts: List[Event]) -> Dict[str, str]:
+        if not evts:
+            return {"count": "0", "span": "—"}
+        yrs = [e.year for e in evts]
+        return {"count": str(len(evts)), "span": f"{_fmt_year(min(yrs))} → {_fmt_year(max(yrs))}"}
+
+    sA, sB = _summ(ev_a), _summ(ev_b)
+
+    with colA:
+        st.subheader(civ_a.name)
+        st.caption(civ_a.region or "")
+        st.metric("Events in view", sA["count"])
+        st.caption(f"Window span: {sA['span']}")
+
+    with colB:
+        st.subheader(civ_b.name)
+        st.caption(civ_b.region or "")
+        st.metric("Events in view", sB["count"])
+        st.caption(f"Window span: {sB['span']}")
+
+    st.divider()
+    st.subheader("Event types (stacked)")
+
+    cnt_a = _kind_counts(ev_a)
+    cnt_b = _kind_counts(ev_b)
+    chart = _build_compare_chart(civ_a.name, cnt_a, civ_b.name, cnt_b)
+    st.plotly_chart(chart, use_container_width=True)
+
+    # Stop here so the normal list/detail view doesn't render beneath
+    st.stop()
 
 # ---------- routing state (list vs detail) ----------
 
