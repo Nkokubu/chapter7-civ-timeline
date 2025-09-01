@@ -112,6 +112,108 @@ def _build_compare_chart(name_a: str, cnt_a: Dict[str, int], name_b: str, cnt_b:
     )
     return fig
 
+# ---- hotspot helpers ----
+def _century_start(y: int) -> int:
+    # floor to the start of that century; works for BCE (negative) too
+    return (math.floor(y / 100.0)) * 100
+
+def _century_starts_in_range(year_range: Tuple[int, int]) -> List[int]:
+    s, e = year_range
+    s = _century_start(s)
+    e = _century_start(e)
+    if e < s:
+        s, e = e, s
+    return list(range(s, e + 1, 100))
+
+def _bin_events_by_century(events: List[Event], year_range: Tuple[int, int]) -> Dict[str, Dict[int, int]]:
+    """
+    Return { region -> { century_start -> count } } for events inside the selected window.
+    Also includes an 'All (visible)' aggregate across regions.
+    """
+    centuries = _century_starts_in_range(year_range)
+    if not centuries:
+        return {}
+
+    def _blank_map():
+        return {c: 0 for c in centuries}
+
+    per_region: Dict[str, Dict[int, int]] = {}
+    all_map = _blank_map()
+
+    for e in events:
+        c = e.civilization
+        if not c:
+            continue
+        cs = _century_start(e.year)
+        if cs < centuries[0] or cs > centuries[-1]:
+            continue
+        region = (c.region or "Unknown").strip()
+        per_region.setdefault(region, _blank_map())
+        per_region[region][cs] += 1
+        all_map[cs] += 1
+
+    if any(v > 0 for v in all_map.values()):
+        per_region = {"All (visible)": all_map, **per_region}
+
+    return per_region
+
+def _quintile_threshold(counts: List[int]) -> int | None:
+    """80th percentile-ish threshold; use only positive counts to avoid 'all zero' highlighting."""
+    positives = [c for c in counts if c > 0]
+    if not positives:
+        return None
+    positives.sort()
+    # index for ~80th percentile
+    q_idx = max(0, math.ceil(0.8 * len(positives)) - 1)
+    return positives[q_idx]
+
+def _build_region_sparkline(title: str, series: Dict[int, int]) -> go.Figure | None:
+    """
+    Tiny sparkline: x = century starts, y = counts; top quintile highlighted as dots.
+    """
+    if not series:
+        return None
+    xs = sorted(series.keys())
+    ys = [series[x] for x in xs]
+    thr = _quintile_threshold(ys)
+
+    fig = go.Figure()
+
+    # base line
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="lines",
+        line=dict(width=2),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+
+    # highlight points (top quintile)
+    if thr is not None:
+        hx = [x for x, y in zip(xs, ys) if y >= thr]
+        hy = [y for y in ys if y >= thr]
+        fig.add_trace(go.Scatter(
+            x=hx, y=hy, mode="markers",
+            marker=dict(size=9, color="#F39C12", line=dict(width=0.5)),
+            name="hotspot",
+            hovertemplate=f"<b>{title}</b><br>%{{x}} → %{{y}} events<extra></extra>",
+            showlegend=False,
+        ))
+
+    # minimalist “sparkline” styling
+    fig.update_layout(
+        height=120,
+        margin=dict(l=10, r=10, t=8, b=8),
+        xaxis=dict(
+            showgrid=False, zeroline=False, showticklabels=False, fixedrange=True
+        ),
+        yaxis=dict(
+            showgrid=False, zeroline=False, showticklabels=False, fixedrange=True, rangemode="tozero"
+        ),
+        title=dict(text=title, x=0.02, y=0.95, xanchor="left", yanchor="top", font=dict(size=12)),
+    )
+    return fig
+
+
 
 # ---- kind taxonomy, colors, icons ----
 KIND_TAXONOMY = ["war", "dynasty", "tech", "culture", "economy", "religion"]
@@ -577,6 +679,24 @@ if st.session_state.selected_civ_id is None:
     else:
         st.info("No mapped civilizations for the current filters.")
 
+    # ---- Hotspot detection (sparklines per region) ----
+    st.subheader("Hotspots by century")
+    st.caption("Top-quintile centuries are highlighted (based on counts within each series).")
+
+    binned = _bin_events_by_century(events, year_range)
+    if not binned:
+        st.info("No events in this window to analyze.")
+    else:
+        # lay out sparklines in a neat grid
+        regions = list(binned.keys())
+        cols_per_row = 3
+        for i in range(0, len(regions), cols_per_row):
+            cols = st.columns(cols_per_row)
+            for col, region in zip(cols, regions[i:i+cols_per_row]):
+                with col:
+                    fig = _build_region_sparkline(region, binned[region])
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
 
     # grid of cards (3 per row)
     cols_per_row = 3
