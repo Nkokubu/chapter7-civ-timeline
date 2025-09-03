@@ -1,0 +1,50 @@
+{
+  "maritime trade": {
+    "year_range": [
+      -1000,
+      1600
+    ],
+    "regions": [],
+    "tags": [
+      "trade",
+      "naval",
+      "maritime",
+      "sea",
+      "silk-road"
+    ]
+  },
+  "iron adoption": {
+    "year_range": [
+      -1300,
+      600
+    ],
+    "regions": [],
+    "tags": [
+      "iron",
+      "metallurgy",
+      "tech"
+    ]
+  },
+  "classical era": {
+    "year_range": [
+      -800,
+      500
+    ],
+    "regions": [],
+    "tags": []
+  },
+  "Maritime_test": {
+    "year_range": [
+      -2850,
+      1600
+    ],
+    "regions": [],
+    "tags": [
+      "trade",
+      "naval",
+      "maritime",
+      "sea",
+      "silk-road"
+    ]
+  }
+}

@@ -11,7 +11,8 @@ from app.models.event import Event
 import plotly.graph_objects as go
 import math
 from typing import Optional
-
+import json
+from pathlib import Path
 
 st.set_page_config(page_title="Civilization Explorer", layout="wide")
 
@@ -213,6 +214,61 @@ def _build_region_sparkline(title: str, series: Dict[int, int]) -> go.Figure | N
     )
     return fig
 
+# ---- Theme Lenses ----
+LENS_FILE = Path("data/lenses.json")
+
+_DEFAULT_LENSES = {
+    "maritime trade": {
+        "year_range": (-1000, 1600),
+        "regions": [],  # all regions
+        "tags": ["trade", "naval", "maritime", "sea", "silk-road"]
+    },
+    "iron adoption": {
+        "year_range": (-1300, 600),
+        "regions": [],
+        "tags": ["iron", "metallurgy", "tech"]
+    },
+    "classical era": {
+        "year_range": (-800, 500),
+        "regions": [],
+        "tags": []  # just the window
+    }
+}
+
+def _ensure_lens_file() -> None:
+    LENS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not LENS_FILE.exists():
+        with LENS_FILE.open("w", encoding="utf-8") as f:
+            json.dump(_DEFAULT_LENSES, f, indent=2)
+
+def _load_lenses() -> dict:
+    _ensure_lens_file()
+    try:
+        with LENS_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_lenses(lenses: dict) -> None:
+    _ensure_lens_file()
+    with LENS_FILE.open("w", encoding="utf-8") as f:
+        json.dump(lenses, f, indent=2)
+
+def _apply_lens_to_state(lens: dict) -> None:
+    # Update widget state so the UI changes on the next rerun
+    yr = lens.get("year_range", (-500, 500))
+    st.session_state["f_year_range"] = (int(yr[0]), int(yr[1]))
+    st.session_state["f_regions"] = list(lens.get("regions", []))
+    st.session_state["f_tags"]    = list(lens.get("tags", []))
+
+def _on_pick_lens():
+    name = st.session_state.get("lens_select")
+    lenses = st.session_state.get("_lenses_cache", {})
+    lens = lenses.get(name)
+    if lens:
+        _apply_lens_to_state(lens)
+
 
 
 # ---- kind taxonomy, colors, icons ----
@@ -244,6 +300,89 @@ def _norm_kind(k: str | None) -> str:
         return "other"
     kk = k.strip().lower()
     return kk if kk in KIND_TAXONOMY else "other"
+
+# ---- Sequence hints helpers ----
+MAJOR_KINDS = {"war", "dynasty", "religion", "tech"}
+MAJOR_TAG_WORDS = [
+    "found", "founding", "unification", "conquest",
+    "collapse", "fall", "decline", "rise", "annex", "reform", "edict"
+]
+
+def _looks_major(e: Event) -> bool:
+    """Heuristic: a 'major' change is a 'big' kind or tagged with impactful words."""
+    kind = _norm_kind(e.kind)
+    if kind in MAJOR_KINDS:
+        return True
+    tags = (e.tags or "").lower()
+    return any(w in tags for w in MAJOR_TAG_WORDS)
+
+def _sequence_hints(
+    target: Civilization,
+    target_events: List[Event],
+    window: Tuple[int, int],
+    neighbors: List[Dict] | None = None,
+    delta: int = 50,
+    max_per_neighbor: int = 3,
+    max_total: int = 50,
+) -> List[Dict]:
+    """
+    Find major events in overlapping civilizations that occur within ±delta years
+    of ANY event for the target civ inside the current window.
+    Returns a flat list of {neighbor_id, neighbor_name, year, title, kind, distance}.
+    """
+    if not target_events:
+        return []
+
+    t_years = [e.year for e in target_events]
+    w0, w1 = window
+
+    # Reuse neighbors (Day 9) if provided; otherwise compute
+    if neighbors is None:
+        neighbors = _neighbors_by_overlap(target, window)
+    neighbor_ids = [nb["id"] for nb in neighbors]
+    if not neighbor_ids:
+        return []
+
+    # Pull neighbor events once, in-window, with civ eager-loaded
+    with get_session() as s:
+        evs = s.exec(
+            select(Event)
+            .options(selectinload(Event.civilization))
+            .where(
+                Event.civilization_id.in_(neighbor_ids),
+                Event.year >= w0,
+                Event.year <= w1,
+            )
+            .order_by(Event.year)
+        ).all()
+
+    # Keep only "major" events close in time to ANY target event
+    by_neighbor: Dict[int, List[Dict]] = {}
+    for ev in evs:
+        if not _looks_major(ev):
+            continue
+        d = min(abs(ev.year - ty) for ty in t_years)
+        if d <= delta and ev.civilization:
+            row = {
+                "neighbor_id": ev.civilization.id,
+                "neighbor_name": ev.civilization.name,
+                "year": ev.year,
+                "title": ev.title,
+                "kind": _norm_kind(ev.kind),
+                "distance": d,
+            }
+            by_neighbor.setdefault(ev.civilization.id, []).append(row)
+
+    # Limit per neighbor by closest distance
+    out: List[Dict] = []
+    for nid, items in by_neighbor.items():
+        items.sort(key=lambda r: (r["distance"], r["year"]))
+        out.extend(items[:max_per_neighbor])
+
+    # Global cap, sorted by proximity then year
+    out.sort(key=lambda r: (r["distance"], r["year"], r["neighbor_name"]))
+    return out[:max_total]
+
 
 
 def _build_timeline_bands(events: List[Event], year_range: Tuple[int, int]):
@@ -544,14 +683,100 @@ def _civ_coords(civ):
 # ---------- sidebar filters ----------
 
 st.sidebar.header("Filters")
-year_range = st.sidebar.slider("Year range", min_value=-3000, max_value=2000, value=(-500, 500), step=50)
+# ---- Theme lenses (save/load presets) ----
+lenses = _load_lenses()
+st.session_state["_lenses_cache"] = lenses  # used by on_change callback
+
+with st.sidebar.expander("Theme lenses", expanded=False):
+    lens_names = sorted(lenses.keys())
+    st.selectbox(
+        "Load a lens",
+        options=["—"] + lens_names,
+        key="lens_select",
+        on_change=_on_pick_lens
+    )
+
+    st.divider()
+    st.caption("Save current filters as a lens")
+    new_name = st.text_input("Lens name", key="lens_name_input", placeholder="e.g., maritime trade 2")
+    save_col, del_col = st.columns([1, 1], gap="small")
+
+    with save_col:
+        if st.button("Save lens", use_container_width=True, type="primary"):
+            if new_name.strip():
+                lenses[new_name.strip()] = {
+                    "year_range": st.session_state.get("f_year_range", (-500, 500)),
+                    "regions":    st.session_state.get("f_regions", []),
+                    "tags":       st.session_state.get("f_tags", []),
+                }
+                _save_lenses(lenses)
+                st.session_state["_lenses_cache"] = lenses
+                st.success(f"Saved lens: {new_name.strip()}", icon="✅")
+            else:
+                st.warning("Please enter a lens name.")
+
+    with del_col:
+        if lens_names and st.button("Delete selected", use_container_width=True):
+            sel = st.session_state.get("lens_select")
+            if sel in lenses:
+                del lenses[sel]
+                _save_lenses(lenses)
+                st.session_state["_lenses_cache"] = lenses
+                st.session_state["lens_select"] = "—"
+                st.success(f"Deleted lens: {sel}", icon="✅")
+            else:
+                st.info("Pick a lens to delete.")
+
+
+
 
 # regions/tags are loaded once per run to keep the UI snappy
 all_regions = _distinct_regions()
 all_tags = _distinct_tags()
 
-selected_regions = st.sidebar.multiselect("Regions", options=all_regions, default=[])
-selected_tags = st.sidebar.multiselect("Tags", options=all_tags, default=[])
+# Include current lens/default values in options so Streamlit accepts them
+lens_region_defaults = list(st.session_state.get("f_regions", []))
+lens_tag_defaults    = list(st.session_state.get("f_tags", []))
+
+# Build safe options (union of DB-derived options, taxonomy, and any lens values)
+region_options = sorted(set(all_regions) | set(lens_region_defaults), key=str.lower)
+tag_options = sorted(
+    set(all_tags) 
+    | set([k for k in KIND_TAXONOMY if k not in all_tags])
+    | set(lens_tag_defaults),
+    key=str.lower
+)
+
+# (Optional extra safety) sanitize session defaults to subset of options
+st.session_state["f_regions"] = [r for r in lens_region_defaults if r in region_options]
+st.session_state["f_tags"]    = [t for t in lens_tag_defaults    if t in tag_options]
+
+# Render widgets
+year_range = st.sidebar.slider(
+    "Year range",
+    min_value=-3000, max_value=2000,
+    value=st.session_state.get("f_year_range", (-500, 500)),
+    step=50,
+    key="f_year_range"
+)
+
+selected_regions = st.sidebar.multiselect(
+    "Regions",
+    options=region_options,
+    default=st.session_state.get("f_regions", []),
+    key="f_regions"
+)
+
+selected_tags = st.sidebar.multiselect(
+    "Tags (and kinds)",
+    options=tag_options,
+    default=st.session_state.get("f_tags", []),
+    key="f_tags"
+)
+
+
+# Check Box (In case don't forget it)
+
 compare_mode = st.sidebar.checkbox("Compare two civilizations", value=False)
 
 
@@ -766,5 +991,27 @@ else:
                 net = _build_neighbor_graph(civ, nbrs)
                 if net:
                     st.plotly_chart(net, use_container_width=True)
+                      
+            st.divider()
+            # --- Sequence hints (±50 years; sequence, not causation) ---
+            hints = _sequence_hints(civ, rows, year_range, neighbors=nbrs, delta=50)
 
-            st.divider()  
+            c1, c2 = st.columns([1, 8])
+            with c1:
+                # tiny info "badge" with tooltip
+                st.button("ⓘ", help="Sequence hints surface events in overlapping civilizations that occur within ±50 years of this civilization’s events.\nThey show temporal sequence, not causation.", disabled=True)
+            with c2:
+                st.metric("Sequence hints", len(hints))
+
+            if not hints:
+                st.caption("No near-in-time neighbor changes in this window.")
+            else:
+                # group by neighbor for a tidy list
+                grouped: Dict[str, List[Dict]] = {}
+                for h in hints:
+                    grouped.setdefault(h["neighbor_name"], []).append(h)
+
+                for neigh, items in sorted(grouped.items(), key=lambda kv: kv[0]):
+                    st.write(f"**{neigh}**")
+                    for h in items:
+                        st.write(f"- {h['year']}: {h['title']}  ·  {h['kind']}  ·  Δ{h['distance']} yrs")
