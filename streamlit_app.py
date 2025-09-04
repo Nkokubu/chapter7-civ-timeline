@@ -680,9 +680,129 @@ def _civ_coords(civ):
         lon = getattr(civ, "lon", None)
     return lat, lon
 
+# ---- Tech diffusion helpers  ----
+DIFFUSION_THEMES = {
+    "ironworking": ["ironworking", "iron", "metallurgy", "steel", "smelt", "bloomery", "forge"],
+    "christianity": ["christianity", "christian", "christianization", "church"],
+    "trade networks": ["trade", "silk-road", "maritime", "naval", "sea route", "merchant"]
+}
+
+# --- first adoption tags --- kind of set with above
+def _first_adoptions(theme_key: str, year_range: Tuple[int, int], regions: List[str]) -> List[dict]:
+    """
+    Find earliest event per civilization whose TAGS or TITLE match any theme term,
+    restricted to the current year window and (optional) region filter.
+    Returns a sorted list: [{civ, year, title, lat, lon}, ...] by year.
+    """
+    terms = [t.strip().lower() for t in DIFFUSION_THEMES.get(theme_key, [theme_key])]
+    start, end = year_range
+
+    with get_session() as s:
+        stmt = select(Event).options(selectinload(Event.civilization))
+        conds = [Event.year >= start, Event.year <= end]
+
+        if regions:
+            stmt = stmt.join(Civilization)
+            conds.append(or_(*[Civilization.region.ilike(f"%{r}%") for r in regions]))
+
+        # match if ANY term appears in tags OR title (case-insensitive)
+        text_preds = []
+        for t in terms:
+            text_preds.append(Event.tags.ilike(f"%{t}%"))
+            text_preds.append(Event.title.ilike(f"%{t}%"))
+        conds.append(or_(*text_preds))
+
+        stmt = stmt.where(and_(*conds)).order_by(Event.year)
+        rows = s.exec(stmt).all()
+
+    per: Dict[int, dict] = {}
+    for e in rows:
+        c = e.civilization
+        if not c:
+            continue
+        if c.id not in per or e.year < per[c.id]["year"]:
+            lat, lon = _civ_coords(c)
+            per[c.id] = {"civ": c, "year": e.year, "title": e.title, "lat": lat, "lon": lon}
+
+    adoptions = list(per.values())
+    adoptions.sort(key=lambda d: d["year"])
+    return adoptions
+
+
+
+def _build_diffusion_timeline(adoptions: List[dict]) -> go.Figure | None:
+    """Slope-style timeline: points in order of first appearance, connected by a line."""
+    if len(adoptions) < 2:
+        return None
+    names = [a["civ"].name for a in adoptions]
+    years = [a["year"] for a in adoptions]
+    y_idx = list(range(len(names)))
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=years, y=y_idx, mode="lines+markers",
+        text=[f"{n}<br>{_fmt_year(y)}" for n, y in zip(names, years)],
+        hoverinfo="text",
+        line=dict(width=2),
+        marker=dict(size=10),
+        showlegend=False,
+    ))
+    fig.update_yaxes(tickvals=y_idx, ticktext=names, title="")
+    fig.update_xaxes(title="Year")
+    fig.update_layout(height=320, margin=dict(l=160, r=20, t=10, b=40))
+    return fig
+
+def _build_diffusion_map(adoptions: List[dict]) -> go.Figure | None:
+    """Map with segments from earlier to later adoptions. Requires at least two points with coords."""
+    # build line segments for consecutive pairs
+    line_traces = []
+    for a, b in zip(adoptions, adoptions[1:]):
+        if None in (a["lat"], a["lon"], b["lat"], b["lon"]):
+            continue
+        line_traces.append(go.Scattergeo(
+            lat=[a["lat"], b["lat"]],
+            lon=[a["lon"], b["lon"]],
+            mode="lines",
+            line=dict(width=2),
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+
+    # node markers
+    lats, lons, texts = [], [], []
+    for a in adoptions:
+        if a["lat"] is None or a["lon"] is None:
+            continue
+        lats.append(a["lat"]); lons.append(a["lon"])
+        texts.append(f'{a["civ"].name}<br>{_fmt_year(a["year"])}')
+
+    if not lats:
+        return None
+
+    fig = go.Figure()
+    for tr in line_traces:
+        fig.add_trace(tr)
+    fig.add_trace(go.Scattergeo(
+        lat=lats, lon=lons, text=texts, hoverinfo="text",
+        mode="markers", marker=dict(size=10, line=dict(width=1))
+    ))
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=420,
+        geo=dict(
+            projection_type="natural earth",
+            showcountries=True, showland=True,
+            landcolor="rgb(229, 236, 246)",
+            coastlinecolor="rgb(150,150,150)",
+        ),
+    )
+    return fig
+
+
 # ---------- sidebar filters ----------
 
 st.sidebar.header("Filters")
+
 # ---- Theme lenses (save/load presets) ----
 lenses = _load_lenses()
 st.session_state["_lenses_cache"] = lenses  # used by on_change callback
@@ -727,6 +847,16 @@ with st.sidebar.expander("Theme lenses", expanded=False):
             else:
                 st.info("Pick a lens to delete.")
 
+#---- Sidebar controls ----
+with st.sidebar.expander("Tech diffusion (beta)", expanded=False):
+    enable_diffusion = st.checkbox("Show diffusion", value=False, key="diff_on")
+    diffusion_theme = st.selectbox(
+        "Theme",
+        options=["christianity", "ironworking", "trade networks"],
+        index=0,
+        key="diff_theme",
+        help="Find earliest → later adoptions within your current year window and region filters."
+    )
 
 
 
@@ -903,6 +1033,26 @@ if st.session_state.selected_civ_id is None:
         st.plotly_chart(map_fig, use_container_width=True)
     else:
         st.info("No mapped civilizations for the current filters.")
+
+    # ---- Diffusion view ----
+if st.session_state.get("diff_on"):
+    theme = st.session_state.get("diff_theme", "christianity")
+    adoptions = _first_adoptions(theme, year_range, selected_regions)
+
+    st.subheader(f"Diffusion: {theme.title()}")
+    if len(adoptions) < 2:
+        st.info("Not enough matching adoptions in this window to draw a path. "
+                "Try widening the year range, switching regions, or picking another theme.")
+    else:
+        tfig = _build_diffusion_timeline(adoptions)
+        if tfig:
+            st.plotly_chart(tfig, use_container_width=True)
+
+        mfig = _build_diffusion_map(adoptions)
+        if mfig:
+            st.plotly_chart(mfig, use_container_width=True)
+
+
 
     # ---- Hotspot detection (sparklines per region) ----
     st.subheader("Hotspots by century")
