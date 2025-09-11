@@ -1,19 +1,20 @@
-from __future__ import annotations
-import os
-from pathlib import Path
-from sqlalchemy import create_engine, inspect
-import subprocess
+# tests/test_migrations.py
+from alembic.config import Config
+from alembic import command
+import sqlite3
 
 def test_migrations_sqlite(tmp_path):
-    db_dir = Path("db"); db_dir.mkdir(exist_ok=True)
-    db_path = db_dir / "test_migrations.db"
-    if db_path.exists():
-        db_path.unlink()
+    db_file = tmp_path / "migrate_test.db"
 
-    os.environ["DATABASE_URL"] = f"sqlite:///{db_path}"
-    res = subprocess.run(["alembic", "upgrade", "head"], capture_output=True, text=True)
-    assert res.returncode == 0, res.stderr
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_file}")
+    command.upgrade(cfg, "head")
 
-    eng = create_engine(os.environ["DATABASE_URL"], connect_args={"check_same_thread": False})
-    tables = set(inspect(eng).get_table_names())
-    assert {"civilization", "event", "tag", "eventtag"} <= tables
+    con = sqlite3.connect(db_file)
+    cur = con.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    tables = {row[0] for row in cur.fetchall()}
+    con.close()
+
+    # core tables should exist
+    assert {"civilizations", "events", "sources", "civ_source_link", "event_source_link"}.issubset(tables)

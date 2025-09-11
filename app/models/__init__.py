@@ -1,4 +1,9 @@
-from .civilization import Civilization
-from .event import Event
+# app/models/__init__.py
+from sqlmodel import SQLModel
+__all__ = ["SQLModel"]
 
-__all__ = ["Civilization", "Event"]
+
+
+
+
+

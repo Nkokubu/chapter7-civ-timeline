@@ -1,12 +1,14 @@
-
-from typing import Optional, List, TYPE_CHECKING      # ← List is imported
+from typing import Optional, List, TYPE_CHECKING
 from sqlmodel import SQLModel, Field, Relationship
+from .source import CivSourceLink  # link model only
 
 if TYPE_CHECKING:
     from .event import Event
+    from .source import Source
 
 class Civilization(SQLModel, table=True):
     __tablename__ = "civilizations"
+
     id: Optional[int] = Field(default=None, primary_key=True)
     slug: str = Field(index=True, unique=True)
     name: str
@@ -16,12 +18,7 @@ class Civilization(SQLModel, table=True):
     lat: Optional[float] = None
     lon: Optional[float] = None
 
-    # MUST be typing.List[...] (capital L), not built-in list[...]
     events: List["Event"] = Relationship(back_populates="civilization")
+    sources: List["Source"] = Relationship(back_populates="civilizations", link_model=CivSourceLink)
 
-    # NEW: centroid (nullable)
-    latitude: Optional[float] = Field(default=None, description="Centroid latitude")
-    longitude: Optional[float] = Field(default=None, description="Centroid longitude")
 
-    # relationships...
-    events: List["Event"] = Relationship(back_populates="civilization")

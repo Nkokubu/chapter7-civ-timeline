@@ -8,6 +8,8 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel  # ✅ get SQLModel from the library, not your app
+from app.models import civilization, event, source  # noqa: F401 (side-effect import to populate metadata)
+# target_metadata = SQLModel.metadata
 
 # Ensure project root is on sys.path (so "app" imports work)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

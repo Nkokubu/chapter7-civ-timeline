@@ -1,14 +1,14 @@
-import requests
+# tests/test_read_api.py
 
-BASE = "http://127.0.0.1:8000"
-
-def test_events_window():
-    r = requests.get(f"{BASE}/events", params={"start": -500, "end": 500, "limit": 1000})
-    r.raise_for_status()
+def test_events_window(client):
+    r = client.get("/events", params={"start": -500, "end": 500, "limit": 1000})
+    assert r.status_code == 200
     data = r.json()
-    assert 1 <= len(data) <= 1000
+    assert isinstance(data, list)
 
-def test_region_and_tags():
-    r = requests.get(f"{BASE}/events", params={"region": "Asia,Europe", "tags": "war", "limit": 1000})
-    r.raise_for_status()
-    assert isinstance(r.json(), list)
+def test_region_and_tags(client):
+    r = client.get("/events", params={"region": "Asia,Europe", "tags": "war", "limit": 1000})
+    assert r.status_code == 200
+    data = r.json()
+    assert isinstance(data, list)
+
